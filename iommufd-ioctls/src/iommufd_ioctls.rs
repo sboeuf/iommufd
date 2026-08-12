@@ -320,6 +320,21 @@ pub enum IommufdHwptData {
     Vtd(iommu_hwpt_vtd_s1),
 }
 
+/// A device that can have nested (stage-1) HWPTs installed against its
+/// [`IommufdVDevice`]. Implemented by the VFIO layer, so a consumer can program
+/// nested translation without depending on that crate.
+pub trait NestedHwptDevice: Send + Sync {
+    /// Install `data` as the stage-1 HWPT, replacing any existing one.
+    fn install_s1_hwpt(
+        &self,
+        vdevice: &mut IommufdVDevice,
+        data: &IommufdHwptData,
+    ) -> std::io::Result<()>;
+
+    /// Revert to the vIOMMU's bypass or abort HWPT, freeing the stage-1 one.
+    fn uninstall_s1_hwpt(&self, vdevice: &mut IommufdVDevice, abort: bool) -> std::io::Result<()>;
+}
+
 #[derive(Clone)]
 pub struct IommufdVDevice {
     pub viommu: Arc<IommufdVIommu>,
