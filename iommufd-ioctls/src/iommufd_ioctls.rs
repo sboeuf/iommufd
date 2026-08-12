@@ -4,7 +4,7 @@
 //
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 
 use iommufd_bindings::iommufd::*;
@@ -71,6 +71,18 @@ impl IommuFd {
 
     pub fn alloc_iommu_vdevice(&self, vdevice_alloc: &mut iommu_vdevice_alloc) -> Result<()> {
         iommufd_syscall::alloc_iommu_vdevice(self, vdevice_alloc)
+    }
+
+    /// Allocate a vEVENTQ against a vIOMMU, returning its id and a readable
+    /// file wrapping the kernel's `out_veventq_fd`.
+    pub fn alloc_veventq(&self, veventq_alloc: &mut iommu_veventq_alloc) -> Result<(u32, File)> {
+        iommufd_syscall::alloc_veventq(self, veventq_alloc)?;
+
+        // Take ownership of the kernel's fd so it is closed on drop.
+        // SAFETY: `out_veventq_fd` is a valid, freshly-opened fd owned by us.
+        let file = unsafe { File::from_raw_fd(veventq_alloc.out_veventq_fd as RawFd) };
+
+        Ok((veventq_alloc.out_veventq_id, file))
     }
 }
 
@@ -199,6 +211,21 @@ impl IommufdVIommu {
             IommufdInvalidateData::Vtd(_) => Err(IommufdError::VtdUnsupported),
         }
     }
+
+    /// Allocate an ARM SMMUv3 vEVENTQ bound to this vIOMMU. `depth` is the
+    /// number of vEVENTs the kernel may queue.
+    pub fn allocate_veventq(&self, depth: u32) -> Result<IommufdVEventQ> {
+        let mut veventq_alloc = iommu_veventq_alloc {
+            size: std::mem::size_of::<iommu_veventq_alloc>() as u32,
+            viommu_id: self.viommu_id,
+            type_: iommu_veventq_type_IOMMU_VEVENTQ_TYPE_ARM_SMMUV3,
+            veventq_depth: depth,
+            ..Default::default()
+        };
+        let (veventq_id, file) = self.iommufd.alloc_veventq(&mut veventq_alloc)?;
+
+        Ok(IommufdVEventQ { veventq_id, file })
+    }
 }
 
 impl Drop for IommufdVIommu {
@@ -216,6 +243,68 @@ impl Drop for IommufdVIommu {
                 eprintln!("Failed to destroy {what} id {id}: {e}");
             }
         }
+    }
+}
+
+/// A decoded ARM SMMUv3 virtual event. The record is absent for a LOST_EVENTS
+/// marker.
+pub type ArmSmmuv3VEvent = (iommufd_vevent_header, Option<iommu_vevent_arm_smmuv3>);
+
+/// A vEVENTQ bound to a vIOMMU. Owns the kernel's fd, so the queue is torn
+/// down on drop.
+pub struct IommufdVEventQ {
+    pub veventq_id: u32,
+    file: File,
+}
+
+impl IommufdVEventQ {
+    /// Poll this to learn when vEVENTs are ready.
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Read and decode the ARM SMMUv3 vEVENTs currently available.
+    ///
+    /// The queue is a sequence of headers, each followed by an event record
+    /// unless it carries `LOST_EVENTS`.
+    pub fn read_arm_smmuv3_events(&mut self) -> std::io::Result<Vec<ArmSmmuv3VEvent>> {
+        use std::io::Read;
+
+        const HDR: usize = std::mem::size_of::<iommufd_vevent_header>();
+        const REC: usize = std::mem::size_of::<iommu_vevent_arm_smmuv3>();
+
+        // One batch; callers loop until the fd reports no more data.
+        let mut buf = vec![0u8; (HDR + REC) * 64];
+        let n = self.file.read(&mut buf)?;
+
+        let mut events = Vec::new();
+        let mut off = 0;
+        while off + HDR <= n {
+            // SAFETY: `iommufd_vevent_header` is a `#[repr(C)]` POD; we read
+            // exactly its size from an in-bounds, initialized slice, and use an
+            // unaligned read since `buf` has no alignment guarantee.
+            let header: iommufd_vevent_header =
+                unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const _) };
+            off += HDR;
+
+            if header.flags & iommu_veventq_flag_IOMMU_VEVENTQ_FLAG_LOST_EVENTS != 0 {
+                events.push((header, None));
+                continue;
+            }
+
+            if off + REC > n {
+                // Truncated: stop rather than read past the batch.
+                break;
+            }
+            // SAFETY: as above; `iommu_vevent_arm_smmuv3` is a `#[repr(C)]` POD
+            // and the `off + REC <= n` check guarantees the read is in bounds.
+            let evt: iommu_vevent_arm_smmuv3 =
+                unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const _) };
+            off += REC;
+            events.push((header, Some(evt)));
+        }
+
+        Ok(events)
     }
 }
 
@@ -380,6 +469,11 @@ ioctl_io_nr!(
     IOMMUFD_TYPE as u32,
     IOMMUFD_CMD_VDEVICE_ALLOC
 );
+ioctl_io_nr!(
+    IOMMU_VEVENTQ_ALLOC,
+    IOMMUFD_TYPE as u32,
+    IOMMUFD_CMD_VEVENTQ_ALLOC
+);
 
 // Safety:
 // - absolutely trust the underlying kernel
@@ -533,6 +627,23 @@ pub(crate) mod iommufd_syscall {
             Ok(())
         }
     }
+
+    pub(crate) fn alloc_veventq(
+        iommufd: &IommuFd,
+        veventq_alloc: &mut iommu_veventq_alloc,
+    ) -> Result<()> {
+        // SAFETY:
+        // 1. The file descriptor provided by 'iommufd' is valid and open.
+        // 2. The 'veventq_alloc' points to initialized memory with expected data structure,
+        // and remains valid for the duration of syscall.
+        // 3. The return value is checked.
+        let ret = unsafe { ioctl_with_mut_ref(iommufd, IOMMU_VEVENTQ_ALLOC(), veventq_alloc) };
+        if ret < 0 {
+            Err(IommufdError::IommuVeventqAlloc(SysError::last()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -550,5 +661,6 @@ mod tests {
         assert_eq!(IOMMUFD_HWPT_INVALIDATE(), 15245);
         assert_eq!(IOMMU_VIOMMU_ALLOC(), 15248);
         assert_eq!(IOMMU_VDEVICE_ALLOC(), 15249);
+        assert_eq!(IOMMU_VEVENTQ_ALLOC(), 15251);
     }
 }

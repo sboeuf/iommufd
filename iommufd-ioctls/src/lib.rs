@@ -38,6 +38,8 @@ pub enum IommufdError {
     IommuGetHwInfo(#[source] SysError),
     #[error("failed to invalidate HWPT: {0}")]
     IommuHwptInvalidate(#[source] SysError),
+    #[error("failed to allocate vEVENTQ: {0}")]
+    IommuVeventqAlloc(#[source] SysError),
     #[error("unsupported S1 HWPT data type: {0}")]
     UnsupportedS1HwptDataType(iommu_hwpt_data_type),
     #[error("S1 HWPT already allocated with for the given vDevice: {0}")]
