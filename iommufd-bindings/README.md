@@ -7,15 +7,15 @@ kernel version running on a particular host. The user must ensure that
 specific structures, members, or constants are supported and valid for the
 kernel version they are using.
 
-Currently, the bindings are generated using bindgen version 0.72.0 and
-kernel version [v6.6](https://github.com/torvalds/linux/tree/v6.6).
+Currently, the bindings are generated using bindgen version 0.72.1 and
+kernel version [v7.1](https://github.com/torvalds/linux/tree/v7.1).
 
 ## Regenerating Bindings
 
 ### Bindgen
-Install bindgen version 0.72.0
+Install bindgen version 0.72.1
 ```bash
-cargo install bindgen-cli --vers 0.72.0
+cargo install bindgen-cli --vers 0.72.1
 ```
 
 ### Linux Kernel
