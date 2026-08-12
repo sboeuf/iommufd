@@ -84,12 +84,27 @@ impl IommuFd {
 
         Ok((veventq_alloc.out_veventq_id, file))
     }
+
+    /// Allocate a HW-accelerated queue against a vIOMMU. Prefer
+    /// [`IommufdVIommu::allocate_hw_queue`], which owns the result.
+    pub fn alloc_hw_queue(&self, hw_queue_alloc: &mut iommu_hw_queue_alloc) -> Result<()> {
+        iommufd_syscall::alloc_hw_queue(self, hw_queue_alloc)
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
 pub enum IommufdInvalidateData {
     Smmuv3(iommu_viommu_arm_smmuv3_invalidate),
     Vtd(iommu_hwpt_vtd_s1_invalidate),
+}
+
+/// Per-type data reported when a vIOMMU is allocated.
+#[derive(Debug, Copy, Clone)]
+pub enum IommufdViommuData {
+    Smmuv3,
+    /// The VINTF page0 mmap window the guest maps to drive its virtual command
+    /// queues trap-free.
+    Tegra241Cmdqv { mmap_offset: u64, mmap_length: u64 },
 }
 
 #[derive(Clone)]
@@ -100,18 +115,28 @@ pub struct IommufdVIommu {
     pub s2_hwpt_id: u32,
     pub bypass_hwpt_id: u32,
     pub abort_hwpt_id: u32,
+    /// Also identifies the vIOMMU type.
+    pub data: IommufdViommuData,
 }
 
 impl IommufdVIommu {
-    /// Create a new vIOMMU instance.
+    /// Create a new vIOMMU instance. `ARM_SMMUV3` gives basic nested
+    /// translation; `TEGRA241_CMDQV` additionally enables HW_QUEUE. Only these
+    /// two types are supported.
     pub fn new(
         iommufd: Arc<IommuFd>,
         ioas_id: u32,
         dev_id: u32,
         s1_hwpt_data_type: iommu_hwpt_data_type,
+        viommu_type: iommu_viommu_type,
     ) -> Result<Self> {
         if s1_hwpt_data_type != iommu_hwpt_data_type_IOMMU_HWPT_DATA_ARM_SMMUV3 {
             return Err(IommufdError::UnsupportedS1HwptDataType(s1_hwpt_data_type));
+        }
+        if viommu_type != iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3
+            && viommu_type != iommu_viommu_type_IOMMU_VIOMMU_TYPE_TEGRA241_CMDQV
+        {
+            return Err(IommufdError::UnsupportedViommuType(viommu_type));
         }
 
         // Refer to “5.2 Stream Table Entry” in SMMUv3 HW Specification
@@ -130,15 +155,31 @@ impl IommufdVIommu {
         iommufd.alloc_iommu_hwpt(&mut s2_iommufd_hwpt_alloc)?;
         let s2_hwpt_id = s2_iommufd_hwpt_alloc.out_hwpt_id;
 
+        // A TEGRA241_CMDQV vIOMMU reports back the VINTF page0 mmap window the
+        // guest uses to drive its virtual command queues.
+        let mut cmdqv_data = iommu_viommu_tegra241_cmdqv::default();
         let mut viommu_alloc = iommu_viommu_alloc {
             size: std::mem::size_of::<iommu_viommu_alloc>() as u32,
-            type_: iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
+            type_: viommu_type,
             hwpt_id: s2_hwpt_id,
             dev_id,
             ..Default::default()
         };
+        if viommu_type == iommu_viommu_type_IOMMU_VIOMMU_TYPE_TEGRA241_CMDQV {
+            viommu_alloc.data_len = std::mem::size_of::<iommu_viommu_tegra241_cmdqv>() as u32;
+            viommu_alloc.data_uptr = &mut cmdqv_data as *mut iommu_viommu_tegra241_cmdqv as u64;
+        }
         iommufd.alloc_iommu_viommu(&mut viommu_alloc)?;
         let viommu_id = viommu_alloc.out_viommu_id;
+
+        let data = if viommu_type == iommu_viommu_type_IOMMU_VIOMMU_TYPE_TEGRA241_CMDQV {
+            IommufdViommuData::Tegra241Cmdqv {
+                mmap_offset: cmdqv_data.out_vintf_mmap_offset,
+                mmap_length: cmdqv_data.out_vintf_mmap_length,
+            }
+        } else {
+            IommufdViommuData::Smmuv3
+        };
 
         // Used while the guest has not initialised the virtual IOMMU.
         let bypass_s1_hwpt_data = iommu_hwpt_arm_smmuv3 {
@@ -183,6 +224,7 @@ impl IommufdVIommu {
             s2_hwpt_id,
             bypass_hwpt_id,
             abort_hwpt_id,
+            data,
         })
     }
 
@@ -212,19 +254,77 @@ impl IommufdVIommu {
         }
     }
 
-    /// Allocate an ARM SMMUv3 vEVENTQ bound to this vIOMMU. `depth` is the
-    /// number of vEVENTs the kernel may queue.
-    pub fn allocate_veventq(&self, depth: u32) -> Result<IommufdVEventQ> {
+    /// Allocate a vEVENTQ of `veventq_type` bound to this vIOMMU. `depth` is
+    /// the number of vEVENTs the kernel may queue.
+    pub fn allocate_veventq(
+        &self,
+        veventq_type: iommu_veventq_type,
+        depth: u32,
+    ) -> Result<IommufdVEventQ> {
         let mut veventq_alloc = iommu_veventq_alloc {
             size: std::mem::size_of::<iommu_veventq_alloc>() as u32,
             viommu_id: self.viommu_id,
-            type_: iommu_veventq_type_IOMMU_VEVENTQ_TYPE_ARM_SMMUV3,
+            type_: veventq_type,
             veventq_depth: depth,
             ..Default::default()
         };
         let (veventq_id, file) = self.iommufd.alloc_veventq(&mut veventq_alloc)?;
 
         Ok(IommufdVEventQ { veventq_id, file })
+    }
+
+    /// Allocate a HW-accelerated queue backing a guest queue that hardware
+    /// accesses directly, so the guest submits to it without trapping. `index`
+    /// is the logical queue within this vIOMMU.
+    ///
+    /// The vIOMMU must have been allocated with a compatible type, or the
+    /// kernel rejects this.
+    /// * `base_addr` - Base of the guest queue memory in the nesting parent
+    ///   (stage-2) address space, i.e. guest-physical.
+    /// * `length` - Length of the guest queue memory, in bytes.
+    pub fn allocate_hw_queue(
+        &self,
+        hw_queue_type: iommu_hw_queue_type,
+        index: u32,
+        base_addr: u64,
+        length: u64,
+    ) -> Result<IommufdHwQueue> {
+        let mut hw_queue_alloc = iommu_hw_queue_alloc {
+            size: std::mem::size_of::<iommu_hw_queue_alloc>() as u32,
+            viommu_id: self.viommu_id,
+            type_: hw_queue_type,
+            index,
+            nesting_parent_iova: base_addr,
+            length,
+            ..Default::default()
+        };
+        self.iommufd.alloc_hw_queue(&mut hw_queue_alloc)?;
+
+        Ok(IommufdHwQueue {
+            iommufd: self.iommufd.clone(),
+            hw_queue_id: hw_queue_alloc.out_hw_queue_id,
+            index,
+            base_addr,
+            length,
+        })
+    }
+}
+
+/// A HW-accelerated queue (vCMDQ) allocated against a vIOMMU. The queue object
+/// is destroyed when this handle is dropped.
+pub struct IommufdHwQueue {
+    iommufd: Arc<IommuFd>,
+    pub hw_queue_id: u32,
+    pub index: u32,
+    pub base_addr: u64,
+    pub length: u64,
+}
+
+impl Drop for IommufdHwQueue {
+    fn drop(&mut self) {
+        if let Err(e) = self.iommufd.destroy_iommu_object(self.hw_queue_id) {
+            eprintln!("Failed to destroy HW queue id {}: {e}", self.hw_queue_id);
+        }
     }
 }
 
@@ -489,6 +589,11 @@ ioctl_io_nr!(
     IOMMUFD_TYPE as u32,
     IOMMUFD_CMD_VEVENTQ_ALLOC
 );
+ioctl_io_nr!(
+    IOMMU_HW_QUEUE_ALLOC,
+    IOMMUFD_TYPE as u32,
+    IOMMUFD_CMD_HW_QUEUE_ALLOC
+);
 
 // Safety:
 // - absolutely trust the underlying kernel
@@ -659,6 +764,23 @@ pub(crate) mod iommufd_syscall {
             Ok(())
         }
     }
+
+    pub(crate) fn alloc_hw_queue(
+        iommufd: &IommuFd,
+        hw_queue_alloc: &mut iommu_hw_queue_alloc,
+    ) -> Result<()> {
+        // SAFETY:
+        // 1. The file descriptor provided by 'iommufd' is valid and open.
+        // 2. The 'hw_queue_alloc' points to initialized memory with expected data structure,
+        // and remains valid for the duration of syscall.
+        // 3. The return value is checked.
+        let ret = unsafe { ioctl_with_mut_ref(iommufd, IOMMU_HW_QUEUE_ALLOC(), hw_queue_alloc) };
+        if ret < 0 {
+            Err(IommufdError::IommuHwQueueAlloc(SysError::last()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -677,5 +799,6 @@ mod tests {
         assert_eq!(IOMMU_VIOMMU_ALLOC(), 15248);
         assert_eq!(IOMMU_VDEVICE_ALLOC(), 15249);
         assert_eq!(IOMMU_VEVENTQ_ALLOC(), 15251);
+        assert_eq!(IOMMU_HW_QUEUE_ALLOC(), 15252);
     }
 }
